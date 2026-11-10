@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Npgsql;
 using Testcontainers.PostgreSql;
@@ -15,6 +16,9 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     public async Task InitializeAsync()
     {
+        Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", "Testing");
+        Environment.SetEnvironmentVariable("HOLD_DURATION_SECONDS", "600");
+
         if (!string.IsNullOrWhiteSpace(_externalConnectionString))
         {
             await EnsureDatabaseExistsAsync(_externalConnectionString);
@@ -52,6 +56,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         }
 
         builder.UseSetting("ConnectionStrings:DefaultConnection", _connectionString);
+        builder.UseSetting("HOLD_DURATION_SECONDS", "600");
         builder.UseEnvironment("Testing");
     }
 

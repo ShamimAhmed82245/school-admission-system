@@ -73,6 +73,12 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
     options.UseNpgsql(connectionString));
 
 builder.Services.AddScoped<IClassService, ClassService>();
+builder.Services.AddScoped<IHoldService, HoldService>();
+
+if (!builder.Environment.IsEnvironment("Testing"))
+{
+    builder.Services.AddHostedService<HoldExpirationService>();
+}
 
 var app = builder.Build();
 
@@ -87,15 +93,16 @@ app.UseExceptionHandler(exceptionApp =>
             .GetRequiredService<ILoggerFactory>()
             .CreateLogger("GlobalExceptionHandler");
 
-        if (feature?.Error is ClassValidationException validationException)
+        var error = feature?.Error;
+        if (error is ClassValidationException or HoldValidationException)
         {
-            logger.LogInformation(validationException, "Class request validation failed.");
+            logger.LogInformation(error, "Request validation failed.");
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
             await context.Response.WriteAsJsonAsync(new ErrorResponse
             {
                 Status = StatusCodes.Status400BadRequest,
                 Title = "Bad Request",
-                Errors = [validationException.Message]
+                Errors = [error.Message]
             });
             return;
         }

@@ -144,6 +144,304 @@ public sealed class HoldService : IHoldService
         return ToDetails(hold);
     }
 
+    public async Task<ConfirmHoldResult> ConfirmAsync(
+        string holdId,
+        string? studentId,
+        CancellationToken cancellationToken)
+    {
+        studentId = ValidateStudentId(studentId);
+        var now = TruncateToUtcMicroseconds(DateTimeOffset.UtcNow);
+
+        var classId = await _dbContext.Holds
+            .AsNoTracking()
+            .Where(hold => hold.Id == holdId)
+            .Select(hold => hold.ClassId)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (classId is null)
+        {
+            return new ConfirmHoldResult.NotFound();
+        }
+
+        await ExpireDueHoldsForClassAsync(classId, now, cancellationToken);
+
+        await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            if (await LockClassAsync(classId, cancellationToken) != 1)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new ConfirmHoldResult.NotFound();
+            }
+
+            var hold = await _dbContext.Holds
+                .AsNoTracking()
+                .FirstOrDefaultAsync(candidate => candidate.Id == holdId, cancellationToken);
+            if (hold is null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new ConfirmHoldResult.NotFound();
+            }
+
+            if (!string.Equals(hold.StudentId, studentId, StringComparison.Ordinal))
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new ConfirmHoldResult.Forbidden(
+                    "Only the student who created this hold can confirm it.");
+            }
+
+            if (hold.Status == HoldStatus.CONFIRMED)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return Confirmed(hold.Id);
+            }
+
+            if (hold.Status is HoldStatus.EXPIRED or HoldStatus.CANCELLED)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new ConfirmHoldResult.Conflict(
+                    hold.Status == HoldStatus.EXPIRED
+                        ? "The hold has expired and cannot be confirmed."
+                        : "The hold has been cancelled and cannot be confirmed.");
+            }
+
+            if (hold.Status != HoldStatus.HELD || hold.ExpiresAt <= now)
+            {
+                await ExpireDueHoldsInCurrentTransactionAsync(classId, now, cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return new ConfirmHoldResult.Conflict(
+                    "The hold has expired and cannot be confirmed.");
+            }
+
+            // Confirm only while still HELD and unexpired; AvailableSeats is unchanged.
+            var confirmed = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"""
+                UPDATE "Holds"
+                SET "Status" = {nameof(HoldStatus.CONFIRMED)},
+                    "UpdatedAt" = {now}
+                WHERE "Id" = {holdId}
+                  AND "StudentId" = {studentId}
+                  AND "Status" = {nameof(HoldStatus.HELD)}
+                  AND "ExpiresAt" > {now}
+                """,
+                cancellationToken);
+
+            if (confirmed != 1)
+            {
+                await ExpireDueHoldsInCurrentTransactionAsync(classId, now, cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+
+                var current = await _dbContext.Holds
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(candidate => candidate.Id == holdId, cancellationToken);
+                if (current is null)
+                {
+                    return new ConfirmHoldResult.NotFound();
+                }
+
+                if (current.Status == HoldStatus.CONFIRMED
+                    && string.Equals(current.StudentId, studentId, StringComparison.Ordinal))
+                {
+                    return Confirmed(current.Id);
+                }
+
+                return new ConfirmHoldResult.Conflict(
+                    current.Status == HoldStatus.CANCELLED
+                        ? "The hold has been cancelled and cannot be confirmed."
+                        : "The hold has expired and cannot be confirmed.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return Confirmed(holdId);
+        }
+        catch
+        {
+            await RollbackIfActiveAsync(transaction, cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<CancelHoldResult> CancelAsync(
+        string holdId,
+        string? studentId,
+        CancellationToken cancellationToken)
+    {
+        studentId = ValidateStudentId(studentId);
+        var now = TruncateToUtcMicroseconds(DateTimeOffset.UtcNow);
+
+        var classId = await _dbContext.Holds
+            .AsNoTracking()
+            .Where(hold => hold.Id == holdId)
+            .Select(hold => hold.ClassId)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (classId is null)
+        {
+            return new CancelHoldResult.NotFound();
+        }
+
+        await ExpireDueHoldsForClassAsync(classId, now, cancellationToken);
+
+        await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            if (await LockClassAsync(classId, cancellationToken) != 1)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new CancelHoldResult.NotFound();
+            }
+
+            var hold = await _dbContext.Holds
+                .AsNoTracking()
+                .FirstOrDefaultAsync(candidate => candidate.Id == holdId, cancellationToken);
+            if (hold is null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new CancelHoldResult.NotFound();
+            }
+
+            if (!string.Equals(hold.StudentId, studentId, StringComparison.Ordinal))
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new CancelHoldResult.Forbidden(
+                    "Only the student who created this hold can cancel it.");
+            }
+
+            if (hold.Status == HoldStatus.CANCELLED)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return new CancelHoldResult.Success();
+            }
+
+            if (hold.Status == HoldStatus.CONFIRMED)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new CancelHoldResult.Conflict(
+                    "A confirmed application cannot be cancelled.");
+            }
+
+            if (hold.Status == HoldStatus.EXPIRED)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return new CancelHoldResult.Conflict(
+                    "The hold has expired and cannot be cancelled.");
+            }
+
+            // Transition HELD → CANCELLED and release the seat in the same transaction.
+            var cancelled = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"""
+                UPDATE "Holds"
+                SET "Status" = {nameof(HoldStatus.CANCELLED)},
+                    "UpdatedAt" = {now}
+                WHERE "Id" = {holdId}
+                  AND "StudentId" = {studentId}
+                  AND "Status" = {nameof(HoldStatus.HELD)}
+                  AND "ExpiresAt" > {now}
+                """,
+                cancellationToken);
+
+            if (cancelled != 1)
+            {
+                await ExpireDueHoldsInCurrentTransactionAsync(classId, now, cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+
+                var current = await _dbContext.Holds
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(candidate => candidate.Id == holdId, cancellationToken);
+                if (current is null)
+                {
+                    return new CancelHoldResult.NotFound();
+                }
+
+                if (current.Status == HoldStatus.CANCELLED
+                    && string.Equals(current.StudentId, studentId, StringComparison.Ordinal))
+                {
+                    return new CancelHoldResult.Success();
+                }
+
+                return new CancelHoldResult.Conflict(
+                    current.Status == HoldStatus.CONFIRMED
+                        ? "A confirmed application cannot be cancelled."
+                        : "The hold has expired and cannot be cancelled.");
+            }
+
+            var released = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"""
+                UPDATE "Classes"
+                SET "AvailableSeats" = "AvailableSeats" + 1,
+                    "UpdatedAt" = {now}
+                WHERE "Id" = {classId}
+                  AND "AvailableSeats" + 1 <= "TotalSeats"
+                """,
+                cancellationToken);
+
+            if (released != 1)
+            {
+                throw new InvalidOperationException(
+                    "Cancelled hold could not release its seat without exceeding total seats.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return new CancelHoldResult.Success();
+        }
+        catch
+        {
+            await RollbackIfActiveAsync(transaction, cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<IReadOnlyList<StudentHoldResponse>> GetMyHoldsAsync(
+        string? studentId,
+        CancellationToken cancellationToken)
+    {
+        studentId = ValidateStudentId(studentId);
+        var now = TruncateToUtcMicroseconds(DateTimeOffset.UtcNow);
+
+        var classIds = await _dbContext.Holds
+            .AsNoTracking()
+            .Where(hold =>
+                hold.StudentId == studentId
+                && hold.Status == HoldStatus.HELD
+                && hold.ExpiresAt <= now)
+            .Select(hold => hold.ClassId)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+
+        foreach (var classId in classIds)
+        {
+            await ExpireDueHoldsForClassAsync(classId, now, cancellationToken);
+        }
+
+        var rows = await _dbContext.Holds
+            .AsNoTracking()
+            .Where(hold => hold.StudentId == studentId)
+            .Join(
+                _dbContext.Classes.AsNoTracking(),
+                hold => hold.ClassId,
+                schoolClass => schoolClass.Id,
+                (hold, schoolClass) => new
+                {
+                    hold.Id,
+                    hold.ClassId,
+                    schoolClass.Name,
+                    hold.Status,
+                    hold.ExpiresAt
+                })
+            .OrderBy(hold => hold.ExpiresAt)
+            .ThenBy(hold => hold.Id)
+            .ToListAsync(cancellationToken);
+
+        return rows
+            .Select(hold => new StudentHoldResponse
+            {
+                HoldId = hold.Id,
+                ClassId = hold.ClassId,
+                ClassName = hold.Name,
+                Status = hold.Status.ToString(),
+                ExpiresAt = hold.ExpiresAt
+            })
+            .ToList();
+    }
+
     public async Task<int> ExpireDueHoldsAsync(CancellationToken cancellationToken)
     {
         var now = TruncateToUtcMicroseconds(DateTimeOffset.UtcNow);
@@ -177,35 +475,10 @@ public sealed class HoldService : IHoldService
                 return 0;
             }
 
-            var expiredCount = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
-                $"""
-                UPDATE "Holds"
-                SET "Status" = {nameof(HoldStatus.EXPIRED)},
-                    "UpdatedAt" = {now}
-                WHERE "ClassId" = {classId}
-                  AND "Status" = {nameof(HoldStatus.HELD)}
-                  AND "ExpiresAt" <= {now}
-                """,
+            var expiredCount = await ExpireDueHoldsInCurrentTransactionAsync(
+                classId,
+                now,
                 cancellationToken);
-
-            if (expiredCount > 0)
-            {
-                var released = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
-                    $"""
-                    UPDATE "Classes"
-                    SET "AvailableSeats" = "AvailableSeats" + {expiredCount},
-                        "UpdatedAt" = {now}
-                    WHERE "Id" = {classId}
-                      AND "AvailableSeats" + {expiredCount} <= "TotalSeats"
-                    """,
-                    cancellationToken);
-
-                if (released != 1)
-                {
-                    throw new InvalidOperationException(
-                        "Expired holds could not release their seats without exceeding total seats.");
-                }
-            }
 
             await transaction.CommitAsync(cancellationToken);
             return expiredCount;
@@ -215,6 +488,53 @@ public sealed class HoldService : IHoldService
             await RollbackIfActiveAsync(transaction, cancellationToken);
             throw;
         }
+    }
+
+    private async Task<int> ExpireDueHoldsInCurrentTransactionAsync(
+        string classId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var expiredCount = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+            $"""
+            UPDATE "Holds"
+            SET "Status" = {nameof(HoldStatus.EXPIRED)},
+                "UpdatedAt" = {now}
+            WHERE "ClassId" = {classId}
+              AND "Status" = {nameof(HoldStatus.HELD)}
+              AND "ExpiresAt" <= {now}
+            """,
+            cancellationToken);
+
+        if (expiredCount > 0)
+        {
+            var released = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"""
+                UPDATE "Classes"
+                SET "AvailableSeats" = "AvailableSeats" + {expiredCount},
+                    "UpdatedAt" = {now}
+                WHERE "Id" = {classId}
+                  AND "AvailableSeats" + {expiredCount} <= "TotalSeats"
+                """,
+                cancellationToken);
+
+            if (released != 1)
+            {
+                throw new InvalidOperationException(
+                    "Expired holds could not release their seats without exceeding total seats.");
+            }
+        }
+
+        return expiredCount;
+    }
+
+    private static ConfirmHoldResult.Success Confirmed(string holdId)
+    {
+        return new ConfirmHoldResult.Success(new ConfirmHoldResponse
+        {
+            HoldId = holdId,
+            Status = nameof(HoldStatus.CONFIRMED)
+        });
     }
 
     private Task<int> LockClassAsync(string classId, CancellationToken cancellationToken)

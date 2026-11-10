@@ -1,0 +1,12 @@
+{
+  "title": "School Admission System",
+  "description": "A simple school admission app for students to browse classes, reserve seats, track application status, and for administrators to create classes.",
+  "language": "en",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

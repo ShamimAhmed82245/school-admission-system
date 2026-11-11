@@ -97,9 +97,37 @@ The backend test project can be executed using the .NET SDK Docker image, withou
 
 Run this command from the project root in PowerShell:
 
+**Option 1: default**
+
 ```powershell
 docker run --rm --mount "type=bind,source=$($PWD.Path)\backend,target=/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-alpine dotnet test SchoolAdmission.Api.Tests/SchoolAdmission.Api.Tests.csproj
 ```
+
+**Option 2: Using the existing Docker Compose PostgreSQL service**
+
+If Option 1 fails because of Docker networking or Testcontainers connectivity, first start the application services:
+
+```powershell
+docker compose up -d db
+```
+
+Then run:
+
+```powershell
+$connectionString = "Host=db;Port=5432;Database=school_admission_test;Username=schooladmin;Password=local_dev_password"
+
+docker run --rm `
+  --network school-admission-system-shamim82245_default `
+  -e "TEST_CONNECTION_STRING=$connectionString" `
+  --mount "type=bind,source=$($PWD.Path)\backend,target=/src" `
+  -w /src `
+  mcr.microsoft.com/dotnet/sdk:10.0-alpine `
+  dotnet test SchoolAdmission.Api.Tests/SchoolAdmission.Api.Tests.csproj
+```
+
+Replace the database credentials with the values configured in your `.env` file if they differ.
+
+Both options run the same backend test suite. Option 2 uses a separate test database named `school_admission_test`.
 
 ## Frontend Data Source
 
